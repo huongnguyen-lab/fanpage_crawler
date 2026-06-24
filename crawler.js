@@ -7,14 +7,14 @@ const fs = require('fs');
 // ============================================================
 const FANPAGES = [
   { name: 'SunLife Vietnam',       url: 'https://www.facebook.com/SunLifeVietnam' },
-//   { name: 'Chubb Life Vietnam',    url: 'https://www.facebook.com/BaohiemChubbLifeVietnam' },
-//   { name: 'FWD Vietnam',           url: 'https://www.facebook.com/BaohiemFWDVietnam' },
-//   { name: 'Dai-ichi Life Vietnam', url: 'https://www.facebook.com/DaiichiLife.Vietnam' },
-//   { name: 'AIA Vietnam',           url: 'https://www.facebook.com/AIAVietnamLifeInsurance' },
-//   { name: 'Bảo Việt Nhân Thọ',    url: 'https://www.facebook.com/www.BaoVietNhanTho.com.vn' },
-//   { name: 'Prudential Vietnam',    url: 'https://www.facebook.com/Prudential.pva' },
-//   { name: 'Manulife Vietnam',      url: 'https://www.facebook.com/ManulifeVietnam' },
-//   { name: 'Generali Vietnam',      url: 'https://www.facebook.com/GeneraliVietnam' },
+  { name: 'Chubb Life Vietnam',    url: 'https://www.facebook.com/BaohiemChubbLifeVietnam' },
+  { name: 'FWD Vietnam',           url: 'https://www.facebook.com/BaohiemFWDVietnam' },
+  { name: 'Dai-ichi Life Vietnam', url: 'https://www.facebook.com/DaiichiLife.Vietnam' },
+  { name: 'AIA Vietnam',           url: 'https://www.facebook.com/AIAVietnamLifeInsurance' },
+  { name: 'Bảo Việt Nhân Thọ',    url: 'https://www.facebook.com/www.BaoVietNhanTho.com.vn' },
+  { name: 'Prudential Vietnam',    url: 'https://www.facebook.com/Prudential.pva' },
+  { name: 'Manulife Vietnam',      url: 'https://www.facebook.com/ManulifeVietnam' },
+  { name: 'Generali Vietnam',      url: 'https://www.facebook.com/GeneraliVietnam' },
 ];
 
 // ============================================================
@@ -27,9 +27,13 @@ const DATE_TO   = '2026-06-24';
 // ============================================================
 // FILES
 // ============================================================
-const OUTPUT_FILE    = 'posts.csv';
-const SESSION_FILE   = 'session.json';
-const KNOWN_IDS_FILE = 'known_posts.json';
+const DATA_DIR        = 'data'; // mỗi fanpage 1 file CSV trong đây
+const SESSION_FILE    = 'session.json';
+const KNOWN_IDS_FILE  = 'known_posts.json';
+
+function sanitizeFilename(name) {
+  return name.replace(/[\/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
+}
 
 // ============================================================
 // DEBUG DUMP — tạm thời để điều tra vì sao thiếu like/comment/share
@@ -287,11 +291,11 @@ function saveKnownIds(ids) {
 }
 
 // ============================================================
-// CSV WRITER
+// CSV WRITER — 1 file riêng cho mỗi fanpage, trong DATA_DIR
 // ============================================================
-function makeCsvWriter() {
+function makeCsvWriter(filePath) {
   return createObjectCsvWriter({
-    path: OUTPUT_FILE,
+    path: filePath,
     header: [
       { id: 'post_date',    title: 'post_date' },
       { id: 'content',      title: 'content' },
@@ -304,7 +308,7 @@ function makeCsvWriter() {
       { id: 'image_urls',   title: 'image_urls' },
       { id: 'video_url',    title: 'video_url' },
     ],
-    append: fs.existsSync(OUTPUT_FILE),
+    append: fs.existsSync(filePath),
   });
 }
 
@@ -422,12 +426,12 @@ async function crawlPage(page, fanpage, knownIds, csvWriter) {
 async function main() {
   console.log('🚀 Facebook Fanpage Crawler');
   console.log(`📅 ${DATE_FROM || '∞'} → ${DATE_TO || 'today'}`);
-  console.log(`📁 Output: ${OUTPUT_FILE}`);
+  console.log(`📁 Output dir: ${DATA_DIR}/`);
+
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const knownIds = loadKnownIds();
   console.log(`📋 Known posts: ${Object.keys(knownIds).length}\n`);
-
-  const csvWriter = makeCsvWriter();
 
   const browser = await chromium.launch({
     headless: false,
@@ -464,6 +468,8 @@ async function main() {
   let total = 0;
   for (const fanpage of FANPAGES) {
     try {
+      const filePath = `${DATA_DIR}/${sanitizeFilename(fanpage.name)}.csv`;
+      const csvWriter = makeCsvWriter(filePath);
       total += await crawlPage(page, fanpage, knownIds, csvWriter);
       saveKnownIds(knownIds);
       await page.waitForTimeout(3000 + Math.random() * 2000);
@@ -473,7 +479,7 @@ async function main() {
   }
 
   await browser.close();
-  console.log(`\n✅ Xong! Tổng ${total} bài mới → ${OUTPUT_FILE}`);
+  console.log(`\n✅ Xong! Tổng ${total} bài mới → ${DATA_DIR}/`);
 }
 
 main().catch(console.error);

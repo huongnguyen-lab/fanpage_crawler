@@ -48,7 +48,7 @@ npm start
 
 ## Output
 
-File `posts.csv` với các cột:
+Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt tên theo tên fanpage (ví dụ `data/SunLife_Vietnam.csv`). Mỗi file có các cột:
 
 | Cột | Mô tả |
 |---|---|
