@@ -29,7 +29,6 @@ const DATE_TO   = '2026-06-24';
 // ============================================================
 const DATA_DIR        = 'data'; // mỗi fanpage 1 file CSV trong đây
 const SESSION_FILE    = 'session.json';
-const KNOWN_IDS_FILE  = 'known_posts.json';
 
 function sanitizeFilename(name) {
   return name.replace(/[\/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
@@ -206,7 +205,7 @@ function parseStoryNode(node, pageName, pageUrl) {
     post_date:    postDate,
     content:      content.replace(/\r?\n/g, ' '),
     fanpage_name: resolvedName,
-    like:         reactions,
+    reaction:     reactions,
     share:        shares,
     comment:      comments,
     fanpage_url:  resolvedUrl,
@@ -264,6 +263,54 @@ function parseResponseBody(rawBody, pageName, pageUrl) {
 }
 
 // ============================================================
+// EXTRACT POSTS EMBEDDED IN INITIAL PAGE HTML
+//
+// Bài viết mới nhất (top of feed) thường được Facebook nhúng sẵn
+// (server-side render) trực tiếp vào HTML ban đầu trong các thẻ
+// <script type="application/json" data-sjs>, KHÔNG đi qua GraphQL XHR
+// nào — nên page.on('response') không bắt được, dẫn tới crawler luôn
+// thiếu mất bài mới nhất. Quét toàn bộ các thẻ script này, tìm mọi
+// Story node (không phụ thuộc path cụ thể, vì path lồng rất sâu và
+// có thể đổi giữa các lần load — vd "data.user...." thay vì
+// "data.node....") rồi parse như post thường.
+// ============================================================
+function findStoryNodes(obj, results = [], depth = 0) {
+  if (depth > 60 || obj == null || typeof obj !== 'object') return results;
+  if (Array.isArray(obj)) {
+    for (const item of obj) findStoryNodes(item, results, depth + 1);
+    return results;
+  }
+  if (obj.__typename === 'Story' && obj.post_id) {
+    results.push(obj);
+  }
+  for (const key of Object.keys(obj)) {
+    findStoryNodes(obj[key], results, depth + 1);
+  }
+  return results;
+}
+
+function parseEmbeddedHtmlPosts(html, pageName, pageUrl) {
+  const bestByPostId = new Map();
+  const re = /<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = re.exec(html))) {
+    let parsed;
+    try { parsed = JSON.parse(m[1]); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object') continue;
+
+    for (const rawNode of findStoryNodes(parsed)) {
+      const post = parseStoryNode(rawNode, pageName, pageUrl);
+      if (!post) continue;
+      const existing = bestByPostId.get(post._postId);
+      if (!existing || post._score > existing._score) {
+        bestByPostId.set(post._postId, post);
+      }
+    }
+  }
+  return [...bestByPostId.values()];
+}
+
+// ============================================================
 // DATE RANGE HELPERS
 // ============================================================
 function isInDateRange(postDate) {
@@ -280,14 +327,48 @@ function isPastDateFrom(postDate) {
 }
 
 // ============================================================
-// KNOWN IDS
+// ĐÃ CÓ TRONG CSV CHƯA?
+//
+// Trước đây dùng 1 file known_posts.json riêng để chống ghi trùng —
+// nhưng nếu file CSV bị xóa/mất mà known_posts.json vẫn còn, crawler sẽ
+// tưởng các post đó "đã lưu rồi" và KHÔNG ghi lại nữa → mất data vĩnh
+// viễn (đã xảy ra thực tế). Giờ lấy chính file CSV của từng fanpage làm
+// nguồn duy nhất: đọc cột post_url đã có sẵn trong file, post nào chưa
+// có post_url trong đó mới được coi là mới. File CSV mất thì coi như
+// chưa crawl gì — không có chuyện "biết nhưng không ghi".
 // ============================================================
-function loadKnownIds() {
-  try { return JSON.parse(fs.readFileSync(KNOWN_IDS_FILE, 'utf8')); }
-  catch { return {}; }
+function parseCsvLine(line) {
+  const fields = [];
+  let cur = '', inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else inQuotes = false;
+      } else cur += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { fields.push(cur); cur = ''; }
+      else cur += c;
+    }
+  }
+  fields.push(cur);
+  return fields;
 }
-function saveKnownIds(ids) {
-  fs.writeFileSync(KNOWN_IDS_FILE, JSON.stringify(ids, null, 2));
+
+function loadExistingPostUrls(filePath) {
+  if (!fs.existsSync(filePath)) return new Set();
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
+  if (lines.length < 2) return new Set();
+  const urlIdx = parseCsvLine(lines[0]).indexOf('post_url');
+  if (urlIdx === -1) return new Set();
+  const urls = new Set();
+  for (let i = 1; i < lines.length; i++) {
+    const url = parseCsvLine(lines[i])[urlIdx];
+    if (url) urls.add(url);
+  }
+  return urls;
 }
 
 // ============================================================
@@ -300,7 +381,7 @@ function makeCsvWriter(filePath) {
       { id: 'post_date',    title: 'post_date' },
       { id: 'content',      title: 'content' },
       { id: 'fanpage_name', title: 'fanpage_name' },
-      { id: 'like',         title: 'like' },
+      { id: 'reaction',     title: 'reaction' },
       { id: 'share',        title: 'share' },
       { id: 'comment',      title: 'comment' },
       { id: 'fanpage_url',  title: 'fanpage_url' },
@@ -315,7 +396,7 @@ function makeCsvWriter(filePath) {
 // ============================================================
 // CRAWL ONE PAGE
 // ============================================================
-async function crawlPage(page, fanpage, knownIds, csvWriter) {
+async function crawlPage(page, fanpage, existingUrls, csvWriter) {
   console.log(`\n📄 ${fanpage.name}`);
   console.log(`   ${fanpage.url}`);
 
@@ -360,6 +441,21 @@ async function crawlPage(page, fanpage, knownIds, csvWriter) {
   } catch {
     console.log('  ⚠️  Navigation timeout (continuing)');
   }
+
+  // Bài mới nhất có thể được nhúng sẵn trong HTML (SSR), không qua GraphQL
+  const html = await page.content();
+  const embeddedPosts = parseEmbeddedHtmlPosts(html, fanpage.name, fanpage.url);
+  for (const post of embeddedPosts) {
+    const existing = bestByPostId.get(post._postId);
+    if (!existing || post._score > existing._score) {
+      bestByPostId.set(post._postId, post);
+    }
+  }
+  if (DEBUG_DUMP) {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true });
+    fs.writeFileSync(`${DEBUG_DIR}/page_content.html`, html);
+    console.log(`  🐛 dumped page HTML, embedded posts found: ${embeddedPosts.length}`);
+  }
   await page.waitForTimeout(3000);
 
   let scrolls = 0;
@@ -395,22 +491,22 @@ async function crawlPage(page, fanpage, knownIds, csvWriter) {
 
   page.off('response', handler);
 
-  // Filter by date range and exclude already-known posts
+  // Filter by date range and exclude posts already in the CSV
   const filtered = [...bestByPostId.values()].filter(p => isInDateRange(p.post_date));
-  const newPosts  = filtered.filter(p => !knownIds[p._postId]);
+  const newPosts  = filtered.filter(p => !existingUrls.has(p.post_url));
 
   // Log results
   for (const p of filtered) {
-    const isNew = !knownIds[p._postId] ? '✅' : '⏭ ';
+    const isNew = !existingUrls.has(p.post_url) ? '✅' : '⏭ ';
     const preview = p.content ? p.content.substring(0, 50) : '(no content)';
-    console.log(`  ${isNew} ${p.post_date} | 👍${p.like} 💬${p.comment} 🔁${p.share} | ${preview}`);
+    console.log(`  ${isNew} ${p.post_date} | 👍${p.reaction} 💬${p.comment} 🔁${p.share} | ${preview}`);
   }
 
   if (newPosts.length > 0) {
     const records = newPosts.map(({ _postId, _score, _creationTime, ...rest }) => rest);
     await csvWriter.writeRecords(records);
     for (const p of newPosts) {
-      knownIds[p._postId] = new Date().toISOString();
+      existingUrls.add(p.post_url);
     }
     console.log(`  💾 Saved ${newPosts.length} new posts`);
   } else {
@@ -429,9 +525,7 @@ async function main() {
   console.log(`📁 Output dir: ${DATA_DIR}/`);
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
-
-  const knownIds = loadKnownIds();
-  console.log(`📋 Known posts: ${Object.keys(knownIds).length}\n`);
+  console.log('');
 
   const browser = await chromium.launch({
     headless: false,
@@ -470,8 +564,8 @@ async function main() {
     try {
       const filePath = `${DATA_DIR}/${sanitizeFilename(fanpage.name)}.csv`;
       const csvWriter = makeCsvWriter(filePath);
-      total += await crawlPage(page, fanpage, knownIds, csvWriter);
-      saveKnownIds(knownIds);
+      const existingUrls = loadExistingPostUrls(filePath);
+      total += await crawlPage(page, fanpage, existingUrls, csvWriter);
       await page.waitForTimeout(3000 + Math.random() * 2000);
     } catch (err) {
       console.error(`  ❌ ${fanpage.name}: ${err.message}`);

@@ -55,7 +55,7 @@ Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt
 | `post_date` | Ngày đăng (YYYY-MM-DD) |
 | `content` | Nội dung bài viết |
 | `fanpage_name` | Tên fanpage |
-| `like` | Tổng số reactions (Like + Love + Haha + ...) |
+| `reaction` | Tổng số reactions (Like + Love + Haha + ...) |
 | `share` | Số share |
 | `comment` | Số comment |
 | `fanpage_url` | URL fanpage |
@@ -65,11 +65,12 @@ Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt
 
 ## Lưu ý
 
-- `known_posts.json` — lưu danh sách post đã crawl, tránh trùng lặp
+- Chống trùng lặp: mỗi lần chạy, crawler đọc cột `post_url` đã có sẵn trong file CSV của từng fanpage để biết bài nào đã lưu rồi — **không dùng file riêng để nhớ trạng thái**. Vì vậy file CSV trong `data/` chính là nguồn dữ liệu duy nhất: xóa file nào thì coi như chưa crawl fanpage đó, lần chạy sau sẽ ghi lại từ đầu cho fanpage đó (không mất dữ liệu các fanpage khác).
 - `session.json` — lưu session đăng nhập Facebook (KHÔNG chia sẻ file này)
 - Crawler scroll tối đa 30 lần mỗi page, dừng khi đến `DATE_FROM`
 - Delay ngẫu nhiên 2-4 giây giữa mỗi scroll để tránh bị detect
-- `like` = tổng reactions, không tách riêng được Like từ Love/Haha/etc
+- `reaction` = tổng reactions, không tách riêng được Like từ Love/Haha/etc
+- Bài viết mới nhất (top of feed) có thể được Facebook nhúng sẵn trong HTML ban đầu (không qua GraphQL) — crawler đọc cả 2 nguồn (GraphQL response + HTML nhúng sẵn) để không bị sót bài mới nhất.
 
 ## Chạy hàng tuần (tự động)
 
