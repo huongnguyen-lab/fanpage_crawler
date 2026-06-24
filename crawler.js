@@ -29,9 +29,20 @@ const DATE_TO   = '2026-06-24';
 // ============================================================
 const DATA_DIR        = 'data'; // mỗi fanpage 1 file CSV trong đây
 const SESSION_FILE    = 'session.json';
+const INITIAL_FEED_WAIT_MS = 2500;
+const INITIAL_FEED_PARSE_RETRIES = 4;
+const PAGE_CONCURRENCY = Number(process.env.PAGE_CONCURRENCY || 2);
+const MAX_SCROLLS = Number(process.env.MAX_SCROLLS || 30);
+const SCROLL_WAIT_MIN_MS = Number(process.env.SCROLL_WAIT_MIN_MS || 1200);
+const SCROLL_WAIT_MAX_MS = Number(process.env.SCROLL_WAIT_MAX_MS || 2200);
+const BLOCK_HEAVY_RESOURCES = process.env.BLOCK_HEAVY_RESOURCES !== '0';
 
 function sanitizeFilename(name) {
   return name.replace(/[\/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
 }
 
 // ============================================================
@@ -310,6 +321,29 @@ function parseEmbeddedHtmlPosts(html, pageName, pageUrl) {
   return [...bestByPostId.values()];
 }
 
+function mergePost(bestByPostId, post) {
+  const existing = bestByPostId.get(post._postId);
+  if (!existing || post._score > existing._score) {
+    bestByPostId.set(post._postId, post);
+    return true;
+  }
+  return false;
+}
+
+async function captureEmbeddedPosts(page, fanpage, bestByPostId) {
+  const before = bestByPostId.size;
+  const html = await page.content();
+  const embeddedPosts = parseEmbeddedHtmlPosts(html, fanpage.name, fanpage.url);
+  for (const post of embeddedPosts) {
+    mergePost(bestByPostId, post);
+  }
+  return {
+    found: embeddedPosts.length,
+    added: bestByPostId.size - before,
+    html,
+  };
+}
+
 // ============================================================
 // DATE RANGE HELPERS
 // ============================================================
@@ -327,52 +361,8 @@ function isPastDateFrom(postDate) {
 }
 
 // ============================================================
-// ĐÃ CÓ TRONG CSV CHƯA?
-//
-// Trước đây dùng 1 file known_posts.json riêng để chống ghi trùng —
-// nhưng nếu file CSV bị xóa/mất mà known_posts.json vẫn còn, crawler sẽ
-// tưởng các post đó "đã lưu rồi" và KHÔNG ghi lại nữa → mất data vĩnh
-// viễn (đã xảy ra thực tế). Giờ lấy chính file CSV của từng fanpage làm
-// nguồn duy nhất: đọc cột post_url đã có sẵn trong file, post nào chưa
-// có post_url trong đó mới được coi là mới. File CSV mất thì coi như
-// chưa crawl gì — không có chuyện "biết nhưng không ghi".
-// ============================================================
-function parseCsvLine(line) {
-  const fields = [];
-  let cur = '', inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (line[i + 1] === '"') { cur += '"'; i++; }
-        else inQuotes = false;
-      } else cur += c;
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ',') { fields.push(cur); cur = ''; }
-      else cur += c;
-    }
-  }
-  fields.push(cur);
-  return fields;
-}
-
-function loadExistingPostUrls(filePath) {
-  if (!fs.existsSync(filePath)) return new Set();
-  const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
-  if (lines.length < 2) return new Set();
-  const urlIdx = parseCsvLine(lines[0]).indexOf('post_url');
-  if (urlIdx === -1) return new Set();
-  const urls = new Set();
-  for (let i = 1; i < lines.length; i++) {
-    const url = parseCsvLine(lines[i])[urlIdx];
-    if (url) urls.add(url);
-  }
-  return urls;
-}
-
-// ============================================================
-// CSV WRITER — 1 file riêng cho mỗi fanpage, trong DATA_DIR
+// CSV WRITER — 1 file riêng cho mỗi fanpage, trong DATA_DIR.
+// Mỗi lần crawl ghi lại snapshot mới, không append vào dữ liệu cũ.
 // ============================================================
 function makeCsvWriter(filePath) {
   return createObjectCsvWriter({
@@ -389,14 +379,14 @@ function makeCsvWriter(filePath) {
       { id: 'image_urls',   title: 'image_urls' },
       { id: 'video_url',    title: 'video_url' },
     ],
-    append: fs.existsSync(filePath),
+    append: false,
   });
 }
 
 // ============================================================
 // CRAWL ONE PAGE
 // ============================================================
-async function crawlPage(page, fanpage, existingUrls, csvWriter) {
+async function crawlPage(page, fanpage, csvWriter) {
   console.log(`\n📄 ${fanpage.name}`);
   console.log(`   ${fanpage.url}`);
 
@@ -426,10 +416,7 @@ async function crawlPage(page, fanpage, existingUrls, csvWriter) {
 
       const posts = parseResponseBody(body, fanpage.name, fanpage.url);
       for (const post of posts) {
-        const existing = bestByPostId.get(post._postId);
-        if (!existing || post._score > existing._score) {
-          bestByPostId.set(post._postId, post);
-        }
+        mergePost(bestByPostId, post);
       }
     } catch { /* ignore */ }
   };
@@ -442,29 +429,32 @@ async function crawlPage(page, fanpage, existingUrls, csvWriter) {
     console.log('  ⚠️  Navigation timeout (continuing)');
   }
 
-  // Bài mới nhất có thể được nhúng sẵn trong HTML (SSR), không qua GraphQL
-  const html = await page.content();
-  const embeddedPosts = parseEmbeddedHtmlPosts(html, fanpage.name, fanpage.url);
-  for (const post of embeddedPosts) {
-    const existing = bestByPostId.get(post._postId);
-    if (!existing || post._score > existing._score) {
-      bestByPostId.set(post._postId, post);
-    }
+  // Bài mới nhất có thể được nhúng sẵn trong HTML (SSR), không qua GraphQL.
+  // Facebook hydrate feed sau domcontentloaded khá chậm, nên retry vài lần
+  // trước khi scroll để không chụp HTML quá sớm và mất bài đầu tiên.
+  let html = '';
+  let embeddedFound = 0;
+  for (let i = 0; i < INITIAL_FEED_PARSE_RETRIES; i++) {
+    await page.waitForTimeout(INITIAL_FEED_WAIT_MS);
+    const result = await captureEmbeddedPosts(page, fanpage, bestByPostId);
+    html = result.html;
+    embeddedFound = result.found;
+    if (result.added > 0 || result.found > 0) break;
   }
   if (DEBUG_DUMP) {
     fs.mkdirSync(DEBUG_DIR, { recursive: true });
     fs.writeFileSync(`${DEBUG_DIR}/page_content.html`, html);
-    console.log(`  🐛 dumped page HTML, embedded posts found: ${embeddedPosts.length}`);
+    console.log(`  🐛 dumped page HTML, embedded posts found: ${embeddedFound}`);
   }
-  await page.waitForTimeout(3000);
 
   let scrolls = 0;
   let noNewCount = 0;
   let lastCount = 0;
 
-  while (scrolls < 30) {
+  while (scrolls < MAX_SCROLLS) {
     await page.evaluate(() => window.scrollBy(0, 1500));
-    await page.waitForTimeout(2000 + Math.random() * 1000);
+    await page.waitForTimeout(randomBetween(SCROLL_WAIT_MIN_MS, SCROLL_WAIT_MAX_MS));
+    await captureEmbeddedPosts(page, fanpage, bestByPostId);
     scrolls++;
 
     const currentCount = bestByPostId.size;
@@ -491,29 +481,59 @@ async function crawlPage(page, fanpage, existingUrls, csvWriter) {
 
   page.off('response', handler);
 
-  // Filter by date range and exclude posts already in the CSV
-  const filtered = [...bestByPostId.values()].filter(p => isInDateRange(p.post_date));
-  const newPosts  = filtered.filter(p => !existingUrls.has(p.post_url));
+  // Filter by date range, then rewrite the fanpage CSV as a fresh snapshot.
+  const filtered = [...bestByPostId.values()]
+    .filter(p => isInDateRange(p.post_date))
+    .sort((a, b) => {
+      const ta = a._creationTime || 0;
+      const tb = b._creationTime || 0;
+      if (tb !== ta) return tb - ta;
+      return (b.post_date || '').localeCompare(a.post_date || '');
+    });
 
   // Log results
   for (const p of filtered) {
-    const isNew = !existingUrls.has(p.post_url) ? '✅' : '⏭ ';
     const preview = p.content ? p.content.substring(0, 50) : '(no content)';
-    console.log(`  ${isNew} ${p.post_date} | 👍${p.reaction} 💬${p.comment} 🔁${p.share} | ${preview}`);
+    console.log(`  ✅ ${p.post_date} | 👍${p.reaction} 💬${p.comment} 🔁${p.share} | ${preview}`);
   }
 
-  if (newPosts.length > 0) {
-    const records = newPosts.map(({ _postId, _score, _creationTime, ...rest }) => rest);
-    await csvWriter.writeRecords(records);
-    for (const p of newPosts) {
-      existingUrls.add(p.post_url);
-    }
-    console.log(`  💾 Saved ${newPosts.length} new posts`);
+  const records = filtered.map(({ _postId, _score, _creationTime, ...rest }) => rest);
+  await csvWriter.writeRecords(records);
+
+  if (records.length > 0) {
+    console.log(`  💾 Wrote ${records.length} posts`);
   } else {
-    console.log(`  ℹ️  No new posts`);
+    console.log(`  ℹ️  No posts in date range`);
   }
 
-  return newPosts.length;
+  return records.length;
+}
+
+async function crawlFanpage(context, fanpage) {
+  const page = await context.newPage();
+  try {
+    const filePath = `${DATA_DIR}/${sanitizeFilename(fanpage.name)}.csv`;
+    const csvWriter = makeCsvWriter(filePath);
+    return await crawlPage(page, fanpage, csvWriter);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  let nextIndex = 0;
+  const results = [];
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, runWorker));
+  return results;
 }
 
 // ============================================================
@@ -523,6 +543,7 @@ async function main() {
   console.log('🚀 Facebook Fanpage Crawler');
   console.log(`📅 ${DATE_FROM || '∞'} → ${DATE_TO || 'today'}`);
   console.log(`📁 Output dir: ${DATA_DIR}/`);
+  console.log(`⚡ Parallel pages: ${PAGE_CONCURRENCY}`);
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
   console.log('');
@@ -559,21 +580,31 @@ async function main() {
     console.log('✅ Đã đăng nhập\n');
   }
 
-  let total = 0;
-  for (const fanpage of FANPAGES) {
-    try {
-      const filePath = `${DATA_DIR}/${sanitizeFilename(fanpage.name)}.csv`;
-      const csvWriter = makeCsvWriter(filePath);
-      const existingUrls = loadExistingPostUrls(filePath);
-      total += await crawlPage(page, fanpage, existingUrls, csvWriter);
-      await page.waitForTimeout(3000 + Math.random() * 2000);
-    } catch (err) {
-      console.error(`  ❌ ${fanpage.name}: ${err.message}`);
-    }
+  await page.close().catch(() => {});
+
+  if (BLOCK_HEAVY_RESOURCES) {
+    await context.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (type === 'image' || type === 'media' || type === 'font') {
+        return route.abort();
+      }
+      return route.continue();
+    });
   }
 
+  const totals = await runWithConcurrency(FANPAGES, PAGE_CONCURRENCY, async (fanpage) => {
+    try {
+      return await crawlFanpage(context, fanpage);
+    } catch (err) {
+      console.error(`  ❌ ${fanpage.name}: ${err.message}`);
+      return 0;
+    }
+  });
+
+  const total = totals.reduce((sum, count) => sum + count, 0);
+
   await browser.close();
-  console.log(`\n✅ Xong! Tổng ${total} bài mới → ${DATA_DIR}/`);
+  console.log(`\n✅ Xong! Tổng ${total} bài → ${DATA_DIR}/`);
 }
 
 main().catch(console.error);

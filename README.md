@@ -46,6 +46,26 @@ npm start
 **Các lần sau:**
 - Crawler tự động chạy không cần tương tác
 
+## Chạy nhanh hơn
+
+Mặc định crawler chạy 2 fanpage song song và chặn tải ảnh/video/font để giảm thời gian tải trang:
+
+```bash
+npm start
+```
+
+Muốn nhanh hơn nữa có thể tăng số tab chạy song song:
+
+```bash
+PAGE_CONCURRENCY=3 npm start
+```
+
+Nếu Facebook bắt đầu trả thiếu dữ liệu hoặc chậm bất thường, giảm lại:
+
+```bash
+PAGE_CONCURRENCY=1 npm start
+```
+
 ## Output
 
 Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt tên theo tên fanpage (ví dụ `data/SunLife_Vietnam.csv`). Mỗi file có các cột:
@@ -65,10 +85,10 @@ Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt
 
 ## Lưu ý
 
-- Chống trùng lặp: mỗi lần chạy, crawler đọc cột `post_url` đã có sẵn trong file CSV của từng fanpage để biết bài nào đã lưu rồi — **không dùng file riêng để nhớ trạng thái**. Vì vậy file CSV trong `data/` chính là nguồn dữ liệu duy nhất: xóa file nào thì coi như chưa crawl fanpage đó, lần chạy sau sẽ ghi lại từ đầu cho fanpage đó (không mất dữ liệu các fanpage khác).
+- Mỗi lần chạy, crawler ghi lại file CSV như một snapshot mới theo `DATE_FROM`/`DATE_TO`: dữ liệu cũ của fanpage đó sẽ bị thay bằng dữ liệu vừa crawl được. Cơ chế này tránh việc cùng một bài bị ghi thành nhiều dòng khi reaction/comment/share thay đổi giữa các lần crawl.
 - `session.json` — lưu session đăng nhập Facebook (KHÔNG chia sẻ file này)
 - Crawler scroll tối đa 30 lần mỗi page, dừng khi đến `DATE_FROM`
-- Delay ngẫu nhiên 2-4 giây giữa mỗi scroll để tránh bị detect
+- Delay ngẫu nhiên mặc định 1.2-2.2 giây giữa mỗi scroll. Có thể chỉnh bằng `SCROLL_WAIT_MIN_MS`, `SCROLL_WAIT_MAX_MS`, `MAX_SCROLLS`.
 - `reaction` = tổng reactions, không tách riêng được Like từ Love/Haha/etc
 - Bài viết mới nhất (top of feed) có thể được Facebook nhúng sẵn trong HTML ban đầu (không qua GraphQL) — crawler đọc cả 2 nguồn (GraphQL response + HTML nhúng sẵn) để không bị sót bài mới nhất.
 
