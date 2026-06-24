@@ -22,7 +22,7 @@ const FANPAGES = [
 // Format: 'YYYY-MM-DD' | null = không giới hạn
 // ============================================================
 const DATE_FROM = '2026-06-01';
-const DATE_TO   = null;
+const DATE_TO   = '2026-06-24';
 
 // ============================================================
 // FILES
@@ -36,9 +36,9 @@ const KNOWN_IDS_FILE = 'known_posts.json';
 // Ghi vài response GraphQL thô ra ./debug để soi cấu trúc thật.
 // Tắt (false) sau khi xong điều tra.
 // ============================================================
-const DEBUG_DUMP = true;
+const DEBUG_DUMP = false;
 const DEBUG_DIR = 'debug';
-const MAX_DEBUG_DUMPS = 8;
+const MAX_DEBUG_DUMPS = 40;
 let debugDumpCount = 0;
 
 // ============================================================
@@ -94,40 +94,40 @@ function extractCreationTime(node) {
 }
 
 // ============================================================
-// EXTRACT FEEDBACK — returns object with reaction/share/comment counts
-// KEY FIX: tries all paths, returns the one with actual numbers > 0
+// EXTRACT FEEDBACK — reaction/share/comment counts
+//
+// Thực tế (verified từ debug dump 24/06): các số liệu này KHÔNG nằm trực
+// tiếp trong object feedback, mà rải trong từng phần tử của
+// `adaptive_ufi_action_renderers[]` (mỗi phần tử ứng với 1 nút Like/
+// Comment/Share ở UFI bar, mỗi phần tử có `feedback` riêng chỉ chứa đúng
+// 1 loại số liệu). Duyệt cả mảng và gom lại, không giả định thứ tự index.
 // ============================================================
 function extractFeedback(node) {
-  const candidates = [];
-
-  // Path A — main path via story_ufi_container
-  const a = get(node,
+  const ctx = get(node,
     'comet_sections', 'feedback', 'story',
     'story_ufi_container', 'story',
-    'feedback_context', 'feedback_target_with_context',
-    'comet_ufi_summary_and_actions_renderer', 'feedback');
-  if (a) candidates.push(a);
+    'feedback_context', 'feedback_target_with_context');
+  if (!ctx) return { reactionCount: 0, shareCount: 0, commentCount: 0 };
 
-  // Path B — top-level feedback (has reaction_count directly)
-  if (node.feedback && node.feedback.reaction_count) candidates.push(node.feedback);
+  const renderers = get(ctx, 'comet_ufi_summary_and_actions_renderer', 'feedback', 'adaptive_ufi_action_renderers') || [];
 
-  // Path C — shareable_from_perspective_of_feed_ufi (sometimes populated)
-  const c = get(node, 'shareable_from_perspective_of_feed_ufi');
-  if (c && c.reaction_count) candidates.push(c);
-
-  // Return the candidate with the highest reaction count (most complete data)
-  let best = null;
-  let bestCount = -1;
-  for (const fb of candidates) {
-    const count = get(fb, 'reaction_count', 'count') ?? 0;
-    if (count > bestCount) {
-      bestCount = count;
-      best = fb;
+  let reactionCount = 0, shareCount = 0, commentCount = 0;
+  for (const r of renderers) {
+    const fb = r?.feedback;
+    if (!fb) continue;
+    if (fb.reaction_count?.count != null) reactionCount = fb.reaction_count.count;
+    if (fb.share_count?.count != null) shareCount = fb.share_count.count;
+    if (fb.comment_rendering_instance?.comments?.total_count != null) {
+      commentCount = fb.comment_rendering_instance.comments.total_count;
     }
   }
 
-  // If no candidate has reaction_count, return first non-null
-  return best || candidates[0] || null;
+  // Fallback: comment count cũng có path trực tiếp ở feedback_target_with_context
+  if (!commentCount) {
+    commentCount = get(ctx, 'comment_rendering_instance', 'comments', 'total_count') ?? 0;
+  }
+
+  return { reactionCount, shareCount, commentCount };
 }
 
 // ============================================================
@@ -168,11 +168,9 @@ function scoreNode(node) {
   if (node.comet_sections) score += 10;   // has full structure
   if (extractContent(node))  score += 5;   // has text
   const fb = extractFeedback(node);
-  if (fb) {
-    score += get(fb, 'reaction_count', 'count') > 0 ? 3 : 0;
-    score += get(fb, 'share_count', 'count') > 0 ? 2 : 0;
-    score += get(fb, 'comment_rendering_instance', 'comments', 'total_count') > 0 ? 2 : 0;
-  }
+  score += fb.reactionCount > 0 ? 3 : 0;
+  score += fb.shareCount    > 0 ? 2 : 0;
+  score += fb.commentCount  > 0 ? 2 : 0;
   if (extractCreationTime(node)) score += 3;
   return score;
 }
@@ -196,9 +194,9 @@ function parseStoryNode(node, pageName, pageUrl) {
   const resolvedUrl  = actor?.url  || pageUrl;
 
   const fb = extractFeedback(node);
-  const reactions = get(fb, 'reaction_count', 'count') ?? 0;
-  const comments  = get(fb, 'comment_rendering_instance', 'comments', 'total_count') ?? 0;
-  const shares    = get(fb, 'share_count', 'count') ?? 0;
+  const reactions = fb.reactionCount;
+  const comments  = fb.commentCount;
+  const shares    = fb.shareCount;
 
   return {
     post_date:    postDate,
@@ -325,12 +323,20 @@ async function crawlPage(page, fanpage, knownIds, csvWriter) {
     try {
       const body = await response.text();
 
-      if (DEBUG_DUMP && debugDumpCount < MAX_DEBUG_DUMPS) {
-        fs.mkdirSync(DEBUG_DIR, { recursive: true });
-        const file = `${DEBUG_DIR}/dump_${debugDumpCount}.json`;
-        fs.writeFileSync(file, body);
-        console.log(`  🐛 debug dump → ${file}`);
-        debugDumpCount++;
+      if (DEBUG_DUMP) {
+        const postData = response.request().postData() || '';
+        const nameMatch = postData.match(/fb_api_req_friendly_name=([^&]+)/);
+        const friendlyName = nameMatch ? decodeURIComponent(nameMatch[1]) : '(unknown)';
+        const hasReaction = body.includes('reaction_count');
+        console.log(`  🐛 [${friendlyName}] reaction_count=${hasReaction} size=${body.length}`);
+
+        if (debugDumpCount < MAX_DEBUG_DUMPS) {
+          fs.mkdirSync(DEBUG_DIR, { recursive: true });
+          const safeName = friendlyName.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const file = `${DEBUG_DIR}/dump_${debugDumpCount}_${safeName}.json`;
+          fs.writeFileSync(file, body);
+          debugDumpCount++;
+        }
       }
 
       const posts = parseResponseBody(body, fanpage.name, fanpage.url);
