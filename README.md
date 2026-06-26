@@ -80,6 +80,7 @@ Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt
 | `comment` | Số comment |
 | `fanpage_url` | URL fanpage |
 | `post_url` | URL bài viết |
+| `post_id` | ID bài viết trên Facebook |
 | `image_urls` | URL ảnh (nhiều ảnh cách nhau bởi " | ") |
 | `video_url` | URL video (nếu có) |
 
