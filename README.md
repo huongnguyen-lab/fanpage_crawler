@@ -83,6 +83,17 @@ Mỗi fanpage được ghi ra 1 file CSV riêng trong thư mục `data/`, đặt
 | `post_id` | ID bài viết trên Facebook |
 | `image_urls` | URL ảnh (nhiều ảnh cách nhau bởi " | ") |
 | `video_url` | URL video (nếu có) |
+| `video_view` | Số lượt xem video/reel, được bổ sung bằng script riêng |
+
+## Bổ sung video views
+
+Sau khi chạy `npm start`, có thể chạy thêm script này để crawl tab `/reels/` của từng fanpage và map views về CSV bằng reel/video ID trong `post_url`:
+
+```bash
+npm run fill-video-views
+```
+
+Script này chỉ map được các dòng có `post_url` dạng `/reel/<id>` hoặc `/videos/<id>`. Các post thường dạng `/posts/pfbid...` không có reel/video ID trong URL thì sẽ không được map.
 
 ## Lưu ý
 
