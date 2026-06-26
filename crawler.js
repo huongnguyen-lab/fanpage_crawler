@@ -22,7 +22,7 @@ const FANPAGES = [
 // Format: 'YYYY-MM-DD' | null = không giới hạn
 // ============================================================
 const DATE_FROM = '2026-06-01';
-const DATE_TO   = '2026-06-24';
+const DATE_TO   = '2026-06-26';
 
 // ============================================================
 // FILES
@@ -147,6 +147,58 @@ function extractFeedback(node) {
 // ============================================================
 // EXTRACT IMAGE URLs
 // ============================================================
+function isLikelyFacebookImageUrl(value) {
+  if (typeof value !== 'string') return false;
+  if (!/^https?:\/\//.test(value)) return false;
+
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.toLowerCase();
+    const isFacebookCdn =
+      host.includes('fbcdn.net') ||
+      host.includes('fbsbx.com') ||
+      host.includes('facebook.com');
+    const looksLikeImage =
+      path.includes('/v/t') ||
+      path.includes('/safe_image.php') ||
+      /\.(jpg|jpeg|png|webp|gif)(\?|$)/.test(path);
+    return isFacebookCdn && looksLikeImage;
+  } catch {
+    return false;
+  }
+}
+
+function shouldSkipImagePath(path) {
+  return path.some(key =>
+    /actor|avatar|badge|icon|profile|reaction|sprout|sticker|ufi/i.test(String(key))
+  );
+}
+
+function collectImageUrls(obj, urls, path = [], depth = 0) {
+  if (depth > 50 || obj == null) return;
+
+  if (typeof obj === 'string') {
+    if (!shouldSkipImagePath(path) && isLikelyFacebookImageUrl(obj)) {
+      urls.add(obj);
+    }
+    return;
+  }
+
+  if (typeof obj !== 'object') return;
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      collectImageUrls(obj[i], urls, path.concat(i), depth + 1);
+    }
+    return;
+  }
+
+  for (const [key, value] of Object.entries(obj)) {
+    collectImageUrls(value, urls, path.concat(key), depth + 1);
+  }
+}
+
 function extractImageUrls(node) {
   const urls = new Set();
   for (const att of (node.attachments || [])) {
@@ -157,6 +209,9 @@ function extractImageUrls(node) {
       if (subUri) urls.add(subUri);
     }
   }
+  collectImageUrls(node.attachments || [], urls, ['attachments']);
+  collectImageUrls(get(node, 'comet_sections', 'content') || {}, urls, ['comet_sections', 'content']);
+  collectImageUrls(node.attached_story || {}, urls, ['attached_story']);
   return [...urls];
 }
 
@@ -185,6 +240,8 @@ function scoreNode(node) {
   score += fb.reactionCount > 0 ? 3 : 0;
   score += fb.shareCount    > 0 ? 2 : 0;
   score += fb.commentCount  > 0 ? 2 : 0;
+  score += Math.min(extractImageUrls(node).length, 5);
+  if (extractVideoUrl(node)) score += 2;
   if (extractCreationTime(node)) score += 3;
   return score;
 }
@@ -262,11 +319,7 @@ function parseResponseBody(rawBody, pageName, pageUrl) {
       const post = parseStoryNode(rawNode, pageName, pageUrl);
       if (!post) continue;
 
-      const existing = bestByPostId.get(post._postId);
-      // Keep whichever version has higher score (more complete data)
-      if (!existing || post._score > existing._score) {
-        bestByPostId.set(post._postId, post);
-      }
+      mergePost(bestByPostId, post);
     }
   }
 
@@ -312,10 +365,7 @@ function parseEmbeddedHtmlPosts(html, pageName, pageUrl) {
     for (const rawNode of findStoryNodes(parsed)) {
       const post = parseStoryNode(rawNode, pageName, pageUrl);
       if (!post) continue;
-      const existing = bestByPostId.get(post._postId);
-      if (!existing || post._score > existing._score) {
-        bestByPostId.set(post._postId, post);
-      }
+      mergePost(bestByPostId, post);
     }
   }
   return [...bestByPostId.values()];
@@ -323,11 +373,26 @@ function parseEmbeddedHtmlPosts(html, pageName, pageUrl) {
 
 function mergePost(bestByPostId, post) {
   const existing = bestByPostId.get(post._postId);
-  if (!existing || post._score > existing._score) {
+  if (!existing || isBetterPost(post, existing)) {
     bestByPostId.set(post._postId, post);
     return true;
   }
   return false;
+}
+
+function mediaCount(post) {
+  const imageCount = post.image_urls ? post.image_urls.split(' | ').filter(Boolean).length : 0;
+  return imageCount + (post.video_url ? 1 : 0);
+}
+
+function isBetterPost(candidate, existing) {
+  if (candidate._score !== existing._score) return candidate._score > existing._score;
+
+  const candidateMedia = mediaCount(candidate);
+  const existingMedia = mediaCount(existing);
+  if (candidateMedia !== existingMedia) return candidateMedia > existingMedia;
+
+  return (candidate.content || '').length > (existing.content || '').length;
 }
 
 async function captureEmbeddedPosts(page, fanpage, bestByPostId) {
